@@ -1,0 +1,48 @@
+# =====================================================================
+# NPU 训练 + NPU 推理 一体镜像
+# ---------------------------------------------------------------------
+# 基础镜像：昇腾官方 PyTorch + CANN 镜像（也可以用 ascendhub/mindie-... 那一类）
+# 默认设：ascendhub/ascend-pytorch:23.0.0-cann7.0-py3.10-torch_npu-2.1
+#       （没这个 tag 时改成你机器上 docker images 能看见的那个）
+# 入口：和 GPU 镜像同一份 entrypoint.sh
+# =====================================================================
+ARG BASE_IMAGE=ascendhub.huawei.com/public-ascendhub/ascend-pytorch:23.0.0-1.11.0-arm64
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONIOENCODING=utf-8 \
+    PYTHONUNBUFFERED=1 \
+    INTEGRATION_DEVICE=npu
+
+# 大部分基础镜像内已经有 CANN runtime + torch + torch_npu，下面只补业务依赖
+RUN pip install --no-cache-dir -U pip || true && \
+    pip install --no-cache-dir \
+        openmim==0.3.9 \
+        numpy==1.24.4 \
+        opencv-python==4.8.1.78 \
+        pillow tqdm tensorboard \
+        rasterio==1.3.9 \
+        shapely==2.0.2 \
+        fiona==1.9.5 \
+        kafka-python==2.0.2 \
+        onnx==1.15.0 \
+        onnxruntime==1.16.3 \
+    || echo "[warn] 部分 pip 包安装失败，请进容器手动补"
+
+# mmseg 装最新稳定，但 NPU 上 mmcv 不能装编译版（要纯 Python 版 mmcv-lite）
+RUN mim install "mmengine>=0.10.0" "mmsegmentation>=1.2.0" || true && \
+    pip install --no-cache-dir mmcv-lite
+
+# 业务代码
+WORKDIR /workspace/mmseg
+COPY . /workspace/mmseg
+
+ENV PYTHONPATH=/workspace/mmseg:/workspace/mmseg/deploy_building
+
+RUN chmod +x /workspace/mmseg/docker/entrypoint.sh && \
+    sed -i 's/\r$//' /workspace/mmseg/docker/entrypoint.sh
+
+ENTRYPOINT ["/workspace/mmseg/docker/entrypoint.sh"]
+CMD ["train"]
