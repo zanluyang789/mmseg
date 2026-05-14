@@ -69,6 +69,61 @@ def _ensure_tuple(v):
     return (str(v),)
 
 
+def _find_local_pth(directory: str, key: str) -> Optional[str]:
+    """
+    在 directory 及其子目录（最多深 2 层）里找文件名包含 key 的 .pth。
+    例如 key='resnet50_v1c' -> 命中 'resnet50_v1c-2cccc1ad.pth'。
+    """
+    if not os.path.isdir(directory):
+        return None
+    for root, dirs, files in os.walk(directory):
+        rel = os.path.relpath(root, directory)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth > 2:
+            dirs[:] = []
+            continue
+        for f in files:
+            if f.endswith(".pth") and key in f:
+                return os.path.join(root, f)
+    return None
+
+
+def _resolve_pretrained(cfg: Config, pretrained_dir: str) -> None:
+    """
+    把 cfg.model.pretrained 从 'open-mmlab://xxx' / URL 替换成 pretrained_dir
+    下的本地 .pth；找不到时设 TORCH_HOME=pretrained_dir，让 torch.hub 后续
+    下载也落到这个目录（路径会是 pretrained_dir/hub/checkpoints/xxx.pth）。
+    """
+    if not pretrained_dir or not os.path.isdir(pretrained_dir):
+        return
+
+    current = cfg.model.get("pretrained", None)
+    if current and (os.path.isabs(current) and os.path.exists(current)):
+        return  # 已经是本地有效路径
+
+    # 从 'open-mmlab://resnet50_v1c' / URL 中提取关键词
+    key = None
+    if current:
+        # e.g. 'open-mmlab://resnet50_v1c' -> 'resnet50_v1c'
+        #      'https://.../resnet50_v1c-2cccc1ad.pth' -> 'resnet50_v1c-2cccc1ad.pth'
+        last = current.split("//")[-1].split("/")[-1].split(":")[-1]
+        key = last.replace(".pth", "")
+
+    local = _find_local_pth(pretrained_dir, key) if key else None
+    if local:
+        cfg.model.pretrained = local
+        print(f"[pretrained] {current} -> {local}", flush=True)
+    else:
+        # 让 torch.hub 后续下载落到 pretrained_dir/hub/checkpoints/
+        os.environ["TORCH_HOME"] = pretrained_dir
+        print(
+            f"[pretrained] 本地没找到 '{key}' 相关 pth，"
+            f"已设 TORCH_HOME={pretrained_dir}，"
+            f"torch.hub 会下载到 {pretrained_dir}/hub/checkpoints/",
+            flush=True,
+        )
+
+
 def _patch_segmentor_classes(cfg: Config, num_classes: int):
     """两处 head 都要改 num_classes"""
     if "decode_head" in cfg.model:
@@ -121,23 +176,40 @@ def build_train_cfg(
     device = device or detect_device()
 
     # -------- 输出 / 工作目录 --------
-    work_dir = task_cfg.get("work_dir") or task_cfg.get("work_space")
-    if work_dir:
-        cfg.work_dir = work_dir
+    # mmengine 的 work_dir 决定了 timestamp 子目录、默认 log 文件、默认 vis_data
+    # 全部位置。按 PDF 表语义：log_path 是日志根目录，所以让 work_dir = log_path，
+    # 这样 mmengine 自动生成的所有"训练痕迹"都在 log/ 下，符合预期。
+    log_path = task_cfg.get("log_path")
+    work_dir_cfg = task_cfg.get("work_dir") or task_cfg.get("work_space")
+    if log_path:
+        cfg.work_dir = log_path
+    elif work_dir_cfg:
+        cfg.work_dir = work_dir_cfg
+    os.makedirs(cfg.work_dir, exist_ok=True)
 
+    # ckpt 不再通过 CheckpointHook 的 out_dir 改路径（mmengine 会把它再叠
+    # 一层 basename(work_dir) 子目录，结果路径不干净）。改用 CkptSyncHook
+    # 在 work_dir 下生成 .pth 后实时同步到 checkpoint_path。
     ckpt_dir = task_cfg.get("checkpoint_path")
     if ckpt_dir:
-        # mmengine CheckpointHook 默认输出到 work_dir，这里允许独立指定
-        ck = cfg.default_hooks.get("checkpoint", {})
-        if isinstance(ck, dict):
-            ck["out_dir"] = ckpt_dir
-            cfg.default_hooks["checkpoint"] = ck
+        # 触发自定义 hook 注册
+        from . import hooks  # noqa: F401
+
+        os.makedirs(ckpt_dir, exist_ok=True)
+        custom_hooks = list(cfg.get("custom_hooks", []) or [])
+        custom_hooks.append(dict(type="CkptSyncHook", ckpt_dir=ckpt_dir, link=False))
+        cfg.custom_hooks = custom_hooks
 
     # -------- 再训练 --------
     retrain = task_cfg.get("retrain_pth_url")
     if retrain:
         cfg.load_from = retrain
         cfg.resume = bool(task_cfg.get("resume_mode") and task_cfg["resume_mode"] != "None")
+
+    # -------- 预训练 backbone 权重 --------
+    pretrained_dir = task_cfg.get("pretrained")
+    if pretrained_dir:
+        _resolve_pretrained(cfg, pretrained_dir)
 
     # -------- 类别 / palette --------
     num_classes = task_cfg.get("num_classes")
@@ -221,15 +293,20 @@ def build_train_cfg(
     cfg.env_cfg.dist_cfg.backend = get_dist_backend(device)
 
     # -------- TensorBoard --------
+    # tensorboard_log_path 是绝对路径，独立于 work_dir / log_path。
+    # 这里直接给 TensorboardVisBackend 一个绝对 save_dir，避免 mmengine 把
+    # vis_data 挂到 work_dir 下。
     tb_dir = task_cfg.get("tensorboard_log_path")
     use_scalar = task_cfg.get("use_tensorboard_scalar", False)
     use_image = task_cfg.get("use_tensorboard_image", False)
     if tb_dir and (use_scalar or use_image):
+        os.makedirs(tb_dir, exist_ok=True)
         backends = list(cfg.get("vis_backends", []) or [])
         backends.append(dict(type="TensorboardVisBackend", save_dir=tb_dir))
         cfg.vis_backends = backends
         if "visualizer" in cfg:
             cfg.visualizer["vis_backends"] = backends
+            cfg.visualizer["save_dir"] = tb_dir
 
     # -------- env 标记，便于日志区分 --------
     env = task_cfg.get("env")

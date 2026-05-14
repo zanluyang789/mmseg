@@ -40,9 +40,24 @@ class FileListSegDataset(BaseSegDataset):
         metainfo:      和 BaseSegDataset 一样
         pipeline:      和 BaseSegDataset 一样
         其余参数透传 BaseSegDataset，但 data_root / data_prefix / ann_file 一般不传
+
+    注意：METAINFO 故意留空，因为任务的 num_classes/classes_name/palette
+    完全由系统下发的 task.conf 决定，不应该在这里写死任何默认类别，
+    否则 mmseg 会做"新 classes 必须是 METAINFO['classes'] 子集"的校验，
+    导致中文类别名或新增类别报 ValueError。
     """
 
-    METAINFO = dict(classes=("background",), palette=[[0, 0, 0]])
+    # 不预设 classes/palette；下游通过 metainfo= 参数显式传入
+    METAINFO = dict()
+
+    @classmethod
+    def get_label_map(cls, new_classes=None):
+        """
+        覆盖 BaseSegDataset.get_label_map，跳过"子集"校验。
+        我们的数据集本来就支持任意类别（系统下发），label 直接按 mask
+        像素值索引即可，不需要 remap。
+        """
+        return None
 
     def __init__(
         self,
