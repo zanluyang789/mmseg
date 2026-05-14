@@ -61,6 +61,7 @@ from postprocess import vectorize  # type: ignore  # noqa: E402
 from send_kafka_msg import send as _kafka_send_env  # type: ignore  # noqa: E402
 
 from .conf_parser import load_task_conf
+from .config_builder import _read_floats_file, _patch_segmentor_classes
 from .device_utils import detect_device, setup_device_env
 
 
@@ -88,6 +89,7 @@ class PthRunner:
         device: str = "cuda",
         tile: int = 512,
         target_class: int = 1,
+        task_cfg: Optional[dict] = None,
     ):
         import torch
         from mmengine.config import Config
@@ -102,6 +104,31 @@ class PthRunner:
             if k in cfg.model and isinstance(cfg.model[k], dict):
                 cfg.model[k]["norm_cfg"] = dict(type="BN", requires_grad=True)
 
+        # 同步 task.conf 的 num_classes（推理时若 task_cfg.num_classes 跟
+        # base config 不一致，必须先调整 head 再 load ckpt，否则形状对不上）
+        task_cfg = task_cfg or {}
+        nc_task = task_cfg.get("num_classes")
+        if nc_task is not None:
+            try:
+                _patch_segmentor_classes(cfg, int(nc_task))
+            except Exception as e:
+                print(f"[PthRunner] num_classes 同步失败({e})，沿用 base config", flush=True)
+
+        # 优先用 task.conf 的 mean_file/std_file —— 跟训练保持一致
+        mean_from_file = _read_floats_file(task_cfg.get("mean_file", ""), None)
+        std_from_file = _read_floats_file(task_cfg.get("std_file", ""), None)
+        dp = cfg.model.get("data_preprocessor", {}) or {}
+        base_mean = dp.get("mean", [123.675, 116.28, 103.53])
+        base_std = dp.get("std", [58.395, 57.12, 57.375])
+        final_mean = mean_from_file if mean_from_file else base_mean
+        final_std = std_from_file if std_from_file else base_std
+        if mean_from_file or std_from_file:
+            print(f"[PthRunner] 用 task.conf mean/std: mean={final_mean} std={final_std}",
+                  flush=True)
+        else:
+            print(f"[PthRunner] 用 base config mean/std: mean={final_mean} std={final_std}",
+                  flush=True)
+
         torch_device = "cuda:0" if device == "cuda" else (
             "npu:0" if device == "npu" else "cpu"
         )
@@ -110,10 +137,8 @@ class PthRunner:
         self.device = torch_device
         self.tile = tile
         self.target_class = target_class
-        # 数据预处理参数
-        dp = cfg.model.get("data_preprocessor", {}) or {}
-        self.mean = torch.tensor(dp.get("mean", [123.675, 116.28, 103.53])).view(1, 3, 1, 1).to(torch_device)
-        self.std = torch.tensor(dp.get("std", [58.395, 57.12, 57.375])).view(1, 3, 1, 1).to(torch_device)
+        self.mean = torch.tensor(final_mean).view(1, 3, 1, 1).to(torch_device)
+        self.std = torch.tensor(final_std).view(1, 3, 1, 1).to(torch_device)
         self.bgr_to_rgb = dp.get("bgr_to_rgb", False)
 
     @property
@@ -149,7 +174,8 @@ class PthRunner:
 
 def make_runner_any(model_path: str, device: str, tile: int = 512,
                     base_config: Optional[str] = None,
-                    target_class: int = 1):
+                    target_class: int = 1,
+                    task_cfg: Optional[dict] = None):
     """根据后缀和设备选 runner"""
     suffix = Path(model_path).suffix.lower()
     if suffix == ".om":
@@ -163,7 +189,8 @@ def make_runner_any(model_path: str, device: str, tile: int = 512,
             raise ValueError("pth 推理需要 base_config（mmseg config 路径）")
         print(f"[runner] Pth ({device}): {model_path}  cfg={base_config}", flush=True)
         return PthRunner(model_path, base_config, device=device,
-                         tile=tile, target_class=target_class)
+                         tile=tile, target_class=target_class,
+                         task_cfg=task_cfg)
     raise ValueError(f"不识别的模型后缀: {suffix}")
 
 
@@ -182,15 +209,53 @@ def _is_geotiff(path: str) -> bool:
 
 
 def _resolve_band_order(task_cfg: dict) -> str:
-    """band_list_file 可以是路径（文件里写 '3,2,1'）或直接给字符串"""
+    """
+    band_list_file 兼容多种格式：
+      - 直接字符串      "3,2,1"
+      - 文件，逗号分隔   "3,2,1"
+      - 文件，空白分隔   "3 2 1"
+      - 文件，每行一个   "0\n1\n2"
+    并且自动识别 0-based / 1-based：
+      - 最小值是 0 -> 系统下发的 0-based 通道索引，全部 +1 转成 1-based
+      - 最小值是 1 -> 已经是 1-based，原样返回
+    返回值始终是 1-based 的逗号分隔字符串（喂给 deploy_building.pick_rgb 后会 -1）。
+    """
+    import re
+
     blf = task_cfg.get("band_list_file")
     if not blf:
         return "3,2,1"
-    if os.path.exists(blf):
+
+    if os.path.isfile(blf):
         with open(blf, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-        return content or "3,2,1"
-    return blf
+            raw = f.read()
+    else:
+        # 不是文件就当字符串
+        raw = str(blf)
+
+    # 用任何空白 / 逗号切
+    parts = [p for p in re.split(r"[,\s]+", raw.strip()) if p]
+    if not parts:
+        return "3,2,1"
+
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        # 解析不了纯数字时退回原字符串（极端兜底）
+        return raw.strip().replace("\n", ",")
+
+    if len(nums) < 3:
+        print(f"[band_order] 警告：只识别到 {len(nums)} 个波段 {nums}，"
+              f"用默认 '3,2,1'", flush=True)
+        return "3,2,1"
+
+    if min(nums) == 0:
+        nums = [n + 1 for n in nums]
+        print(f"[band_order] 检测到 0-based 索引 {parts}, 自动转 1-based {nums}",
+              flush=True)
+
+    # 只取前 3 个，对应 R/G/B
+    return ",".join(str(n) for n in nums[:3])
 
 
 def _save_mask_geotiff(mask: np.ndarray, ref_profile: dict, out_path: str):
@@ -202,15 +267,24 @@ def _save_mask_geotiff(mask: np.ndarray, ref_profile: dict, out_path: str):
         dst.write(mask.astype(np.uint8), 1)
 
 
-def _save_color_png(mask: np.ndarray, palette: List[List[int]], out_path: str):
-    """根据 palette 上色后保存 PNG（多分类时按类索引上色）"""
+def _imwrite_utf8(out_path: str, img_arr: np.ndarray, ext: str = ".png") -> None:
+    """跨平台中文路径友好的 cv2.imwrite 替代品。"""
     import cv2
 
+    ok, buf = cv2.imencode(ext, img_arr)
+    if not ok:
+        raise RuntimeError(f"cv2.imencode 失败: {out_path}")
+    with open(out_path, "wb") as f:
+        f.write(buf.tobytes())
+
+
+def _save_color_png(mask: np.ndarray, palette: List[List[int]], out_path: str):
+    """根据 palette 上色后保存 PNG（多分类时按类索引上色）"""
     h, w = mask.shape
     color = np.zeros((h, w, 3), dtype=np.uint8)
     for idx, rgb in enumerate(palette):
         color[mask == idx] = rgb[::-1]  # BGR -> 给 cv2
-    cv2.imwrite(out_path, color)
+    _imwrite_utf8(out_path, color, ext=".png")
 
 
 def _read_non_geotiff(path: str, band_order_str: str) -> np.ndarray:
@@ -291,10 +365,8 @@ def _process_one(
         prob = slide_infer(rgb, runner, tile=tile, stride=stride, progress_cb=progress_cb)
         mask = (prob >= threshold).astype(np.uint8)
 
-        import cv2
-
         mask_path = output_root / f"{stem}_mask.png"
-        cv2.imwrite(str(mask_path), (mask * 255).astype(np.uint8))
+        _imwrite_utf8(str(mask_path), (mask * 255).astype(np.uint8), ext=".png")
         out["mask"] = str(mask_path)
 
         if use_color:
@@ -330,6 +402,11 @@ def run_inference(
     device: Optional[str] = None,
     base_config: Optional[str] = None,
 ):
+    # 让 GDAL / fiona / rasterio 把所有路径字符串当 UTF-8 处理
+    # —— 中文 output_root（例：'/share/.../建筑物识别'）才不会写文件失败
+    os.environ.setdefault("GDAL_FILENAME_IS_UTF8", "YES")
+    os.environ.setdefault("SHAPE_ENCODING", "UTF-8")
+
     print(f"[run_inference] task_conf = {os.path.abspath(task_conf_path)}", flush=True)
     task_cfg = load_task_conf(task_conf_path)
     print(f"[run_inference] keys = {sorted(task_cfg.keys())}", flush=True)
@@ -363,10 +440,17 @@ def run_inference(
         device = "npu"
 
     tile = int(task_cfg.get("tile", 512))
-    target_class = int(task_cfg.get("target_class", 1))
+    # target_class 默认取最后一类（建筑物=1 / 水体=1 / 多类时取末类）
+    # task.conf 可以用 target_class 字段显式覆盖
+    nc = task_cfg.get("num_classes")
+    default_target = (int(nc) - 1) if nc else 1
+    target_class = int(task_cfg.get("target_class", default_target))
+    print(f"[run_inference] num_classes={nc}, target_class={target_class}", flush=True)
+
     runner = make_runner_any(model_path, device, tile=tile,
                              base_config=base_config,
-                             target_class=target_class)
+                             target_class=target_class,
+                             task_cfg=task_cfg)
 
     _kafka_send(0, "running", "推理任务启动", task_cfg)
 
@@ -422,6 +506,134 @@ def main_cli(argv=None) -> int:
     run_inference(task_conf_path=task_conf_path,
                   device=args.device,
                   base_config=args.base)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main_cli())
+                       target_class=target_class,
+                             task_cfg=task_cfg)
+
+    _kafka_send(0, "running", "推理任务启动", task_cfg)
+
+    try:
+        total = len(images)
+        for i, img in enumerate(images, 1):
+            print(f"\n===== [{i}/{total}] {img} =====", flush=True)
+
+            def cb(done, tot, _i=i, _total=total):
+                # 把单图内的瓦片进度也带上整体百分比
+                per_img = (done / max(tot, 1))
+                overall = int((_i - 1 + per_img) / _total * 90) + 5
+                _kafka_send(min(overall, 95), "running",
+                            f"[{_i}/{_total}] 瓦片 {done}/{tot}", task_cfg)
+
+            try:
+                res = _process_one(img, output_root, runner, task_cfg,
+                                   progress_cb=cb)
+                print(f"  -> {res}", flush=True)
+            except Exception as e:
+                print(f"[error] {img} 推理失败: {e}", flush=True)
+                _kafka_send(int(i / total * 95), "running",
+                            f"[{i}/{total}] 失败: {e}", task_cfg)
+                continue
+
+        _kafka_send(100, "completed", f"完成 {total} 张影像推理", task_cfg)
+    finally:
+        runner.close()
+
+
+def main_cli(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser("mmseg predict (integration)")
+    parser.add_argument("action", nargs="?", default="infer", choices=["infer"])
+    parser.add_argument("--custom-config", default="task",
+                        help="文档要求传 'task'，对应 clie_lib/configs/task.conf；"
+                        "也可以传文件绝对路径")
+    parser.add_argument("--device", default=None,
+                        choices=[None, "cuda", "npu", "cpu"])
+    parser.add_argument("--base", default=None,
+                        help="pth 推理时的 mmseg config（不传则用 configs/deeplabv3plus_building.py）")
+    args = parser.parse_args(argv)
+
+    cc = args.custom_config
+    if cc == "task" or cc is None:
+        task_conf_path = "clie_lib/configs/task.conf"
+    elif os.path.isabs(cc) or cc.endswith(".conf"):
+        task_conf_path = cc
+    else:
+        task_conf_path = f"clie_lib/configs/{cc}.conf"
+
+    run_inference(task_conf_path=task_conf_path,
+                  device=args.device,
+                  base_config=args.base)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main_cli())
+                             target_class=target_class,
+                             task_cfg=task_cfg)
+
+    _kafka_send(0, "running", "推理任务启动", task_cfg)
+
+    try:
+        total = len(images)
+        for i, img in enumerate(images, 1):
+            print(f"\n===== [{i}/{total}] {img} =====", flush=True)
+
+            def cb(done, tot, _i=i, _total=total):
+                per_img = (done / max(tot, 1))
+                overall = int((_i - 1 + per_img) / _total * 90) + 5
+                _kafka_send(min(overall, 95), "running",
+                            f"[{_i}/{_total}] 瓦片 {done}/{tot}", task_cfg)
+
+            try:
+                res = _process_one(img, output_root, runner, task_cfg,
+                                   progress_cb=cb)
+                print(f"  -> {res}", flush=True)
+            except Exception as e:
+                print(f"[error] {img} 推理失败: {e}", flush=True)
+                _kafka_send(int(i / total * 95), "running",
+                            f"[{i}/{total}] 失败: {e}", task_cfg)
+                continue
+
+        _kafka_send(100, "completed", f"完成 {total} 张影像推理", task_cfg)
+    finally:
+        runner.close()
+
+
+def main_cli(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser("mmseg predict (integration)")
+    parser.add_argument("action", nargs="?", default="infer", choices=["infer"])
+    parser.add_argument("--custom-config", default="task",
+                        help="文档要求传 'task'，对应 clie_lib/configs/task.conf；"
+                        "也可以传文件绝对路径")
+    parser.add_argument("--device", default=None,
+                        choices=[None, "cuda", "npu", "cpu"])
+    parser.add_argument("--base", default=None,
+                        help="pth 推理时的 mmseg config（不传则用 configs/deeplabv3plus_building.py）")
+    args = parser.parse_args(argv)
+
+    cc = args.custom_config
+    if cc == "task" or cc is None:
+        task_conf_path = "clie_lib/configs/task.conf"
+    elif os.path.isabs(cc) or cc.endswith(".conf"):
+        task_conf_path = cc
+    else:
+        task_conf_path = f"clie_lib/configs/{cc}.conf"
+
+    run_inference(task_conf_path=task_conf_path,
+                  device=args.device,
+                  base_config=args.base)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main_cli())
     return 0
 
 
