@@ -1,12 +1,19 @@
 # =====================================================================
 # NPU 训练 + NPU 推理 一体镜像
 # ---------------------------------------------------------------------
-# 基础镜像：昇腾官方 PyTorch + CANN 镜像（也可以用 ascendhub/mindie-... 那一类）
-# 默认设：ascendhub/ascend-pytorch:23.0.0-cann7.0-py3.10-torch_npu-2.1
-#       （没这个 tag 时改成你机器上 docker images 能看见的那个）
-# 入口：和 GPU 镜像同一份 entrypoint.sh
+# 默认 BASE: mindie-base:v1.3  =  ascendhub/mindie-gdal-mmdet-mmseg:v1.3
+# 这个 base 已经预装：
+#   - CANN runtime + torch 2.1 + torch_npu
+#   - mmengine / mmcv / mmsegmentation
+#   - rasterio (1.4.4) / shapely / GDAL Python 绑定(osgeo)
+#   - numpy (2.x，但跟 torch 2.1 不兼容，必须降 1.x)
+# 所以本 Dockerfile **只做增量补丁**：
+#   1) 装 openEuler 上 cv2 需要的 libxcb 等系统库
+#   2) numpy 强制降到 1.x
+#   3) 缺的 pip 包按需补：opencv-python-headless / kafka-python / ftfy / regex /
+#      onnx / onnxruntime / fiona (可选)
 # =====================================================================
-ARG BASE_IMAGE=ascendhub.huawei.com/public-ascendhub/ascend-pytorch:23.0.0-1.11.0-arm64
+ARG BASE_IMAGE=mindie-base:v1.3
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -16,26 +23,53 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     INTEGRATION_DEVICE=npu
 
-# 大部分基础镜像内已经有 CANN runtime + torch + torch_npu，下面只补业务依赖
-RUN pip install --no-cache-dir -U pip || true && \
-    pip install --no-cache-dir \
-        openmim==0.3.9 \
-        numpy==1.24.4 \
-        opencv-python==4.8.1.78 \
-        pillow tqdm tensorboard \
-        rasterio==1.3.9 \
-        shapely==2.0.2 \
-        fiona==1.9.5 \
+# ---- 系统库（只装 cv2 / Pillow 的 X11/字体依赖；GDAL 已在 base 里）----
+# 三种包管理器顺序尝试。失败也允许继续（万一 base 里都已经有）。
+RUN ( \
+        apt-get update && apt-get install -y --no-install-recommends \
+            ca-certificates wget git vim \
+            libxcb1 libxrender1 libsm6 libxext6 \
+            libgl1-mesa-glx libglib2.0-0 \
+        && rm -rf /var/lib/apt/lists/* \
+    ) || ( \
+        dnf install -y --setopt=install_weak_deps=False --skip-broken \
+            ca-certificates wget git vim \
+            libxcb libXrender libSM libXext \
+            mesa-libGL glib2 \
+        && dnf clean all \
+    ) || ( \
+        yum install -y --skip-broken \
+            ca-certificates wget git vim \
+            libxcb libXrender libSM libXext \
+            mesa-libGL glib2 \
+        && yum clean all \
+    ) || echo "[warn] 系统库安装跳过：base 里可能已存在"
+
+# ---- Pass 1: 把 numpy 降到 1.x（torch 2.1 是 numpy 1.x 编译的，2.x 会引发 _ARRAY_API not found）
+# 同时确保 pkg_resources 可用（新版 pip 不自带，但有些 setup.py 还在用）。
+RUN python -m pip install --no-cache-dir --upgrade "setuptools<70" wheel && \
+    python -m pip install --no-cache-dir --force-reinstall "numpy<2"
+
+# ---- Pass 2: 补 base 里没有的小包 ----
+# 不动 rasterio / shapely / mmcv / mmengine / mmseg —— base 里有，源码编译会挂
+# 强制 opencv 走 headless 版本，避开 X11
+RUN python -m pip install --no-cache-dir \
+        opencv-python-headless==4.8.1.78 \
         kafka-python==2.0.2 \
+        ftfy \
+        regex \
         onnx==1.15.0 \
         onnxruntime==1.16.3 \
-    || echo "[warn] 部分 pip 包安装失败，请进容器手动补"
+        || echo "[warn] 部分 pip 包安装失败，继续"
 
-# mmseg 装最新稳定，但 NPU 上 mmcv 不能装编译版（要纯 Python 版 mmcv-lite）
-RUN mim install "mmengine>=0.10.0" "mmsegmentation>=1.2.0" || true && \
-    pip install --no-cache-dir mmcv-lite
+# 卸载可能跟 headless 冲突的 opencv-python（如果 base 装了的话）
+RUN python -m pip uninstall -y opencv-python 2>/dev/null || true
 
-# 业务代码
+# ---- Pass 3: fiona 可选（postprocess.py 里有 osgeo / geojson 兜底）----
+RUN python -m pip install --no-cache-dir fiona || \
+    echo "[warn] fiona 装失败，postprocess.py 会走 osgeo / geojson 兜底"
+
+# ---- 业务代码 ----
 WORKDIR /workspace/mmseg
 COPY . /workspace/mmseg
 
