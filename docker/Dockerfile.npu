@@ -12,7 +12,8 @@
 #   2) numpy 强制降到 1.x
 #   3) 缺的 pip 包按需补：
 #        opencv-python-headless / kafka-python / ftfy / regex /
-#        onnx / onnxruntime / fiona (可选) /
+#        onnx / onnxruntime /
+#        fiona (推理输出 .shp 必需，硬装) /
 #        tensorboard (训练 TensorboardVisBackend 必需) /
 #        onnxsim (export_onnx 用，可选)
 # =====================================================================
@@ -68,9 +69,30 @@ RUN python -m pip install --no-cache-dir \
 # 卸载可能跟 headless 冲突的 opencv-python（如果 base 装了的话）
 RUN python -m pip uninstall -y opencv-python 2>/dev/null || true
 
-# ---- Pass 3: fiona 可选（postprocess.py 里有 osgeo / geojson 兜底）----
-RUN python -m pip install --no-cache-dir fiona || \
-    echo "[warn] fiona 装失败，postprocess.py 会走 osgeo / geojson 兜底"
+# ---- Pass 3: fiona —— 推理 postprocess.py 写 .shp 必需 ----
+# 之前是 `pip install fiona || echo`，build 不挂但运行时 shp 写不出。常见原因：
+#   1) pip 默认抓 fiona 1.10+，硬要求 GDAL>=3.4，mindie base 的 GDAL 不一定够新
+#      -> 钉 fiona<1.10（1.9.x 系列只要 GDAL>=3.2）
+#   2) base 是 aarch64/openEuler，PyPI 不一定有预编译 wheel，需源码编译
+#      -> 先 --only-binary 抢 wheel；wheel 没有再补 gdal-devel headers 源码编译
+# 最后一行单独 import 校验，把可用 backend 显式打到 build log，避免运行时才发现。
+RUN python -m pip install --no-cache-dir --only-binary=:all: "fiona>=1.9,<1.10" \
+    || ( \
+        echo ">>> fiona binary wheel 不可用，尝试源码编译" ; \
+        ( apt-get update && apt-get install -y --no-install-recommends \
+              libgdal-dev gdal-bin g++ \
+            && rm -rf /var/lib/apt/lists/* ) \
+        || ( dnf install -y --skip-broken gdal-devel gcc-c++ && dnf clean all ) \
+        || ( yum install -y --skip-broken gdal-devel gcc-c++ && yum clean all ) \
+        || echo "[warn] gdal-devel 装不上，下一步源码编译大概率失败" ; \
+        python -m pip install --no-cache-dir "fiona>=1.9,<1.10" \
+    ) \
+    || echo "[warn] fiona 终究装不上，shp 输出会走 osgeo 兜底"
+
+# fiona / osgeo 可用性校验（build log 一眼能看到）
+RUN python -c "import fiona; print('[shp backend] fiona', fiona.__version__, 'OK')" \
+    || python -c "from osgeo import ogr; print('[shp backend] osgeo fallback only (no fiona)')" \
+    || echo "[ERROR] fiona/osgeo 都不可用！postprocess.py 写 shp 只能走 geojson"
 
 # ---- Pass 4: TensorBoard 训练日志 ----
 # integration/config_builder.py 在 task.conf 启 use_tensorboard_scalar / use_tensorboard_image 时，
