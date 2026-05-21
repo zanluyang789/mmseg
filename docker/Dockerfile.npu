@@ -10,8 +10,11 @@
 # 所以本 Dockerfile **只做增量补丁**：
 #   1) 装 openEuler 上 cv2 需要的 libxcb 等系统库
 #   2) numpy 强制降到 1.x
-#   3) 缺的 pip 包按需补：opencv-python-headless / kafka-python / ftfy / regex /
-#      onnx / onnxruntime / fiona (可选)
+#   3) 缺的 pip 包按需补：
+#        opencv-python-headless / kafka-python / ftfy / regex /
+#        onnx / onnxruntime / fiona (可选) /
+#        tensorboard (训练 TensorboardVisBackend 必需) /
+#        onnxsim (export_onnx 用，可选)
 # =====================================================================
 ARG BASE_IMAGE=mindie-base:v1.3
 FROM ${BASE_IMAGE}
@@ -68,6 +71,22 @@ RUN python -m pip uninstall -y opencv-python 2>/dev/null || true
 # ---- Pass 3: fiona 可选（postprocess.py 里有 osgeo / geojson 兜底）----
 RUN python -m pip install --no-cache-dir fiona || \
     echo "[warn] fiona 装失败，postprocess.py 会走 osgeo / geojson 兜底"
+
+# ---- Pass 4: TensorBoard 训练日志 ----
+# integration/config_builder.py 在 task.conf 启 use_tensorboard_scalar / use_tensorboard_image 时，
+# 会注册 TensorboardVisBackend，mmengine 内部走 torch.utils.tensorboard.SummaryWriter，
+# 必须有 pip `tensorboard`。torch 2.1 配套 tensorboard 2.14.x 最稳。
+#
+# 同时 pin protobuf 到 3.20.3 —— onnx 1.15 / tensorboard 2.14 都兼容，
+# 避免 onnx 触发 "Descriptors cannot be created directly" 报错。
+RUN python -m pip install --no-cache-dir \
+        "protobuf==3.20.3" \
+        "tensorboard==2.14.0"
+
+# ---- Pass 5: 部署/导出阶段才会用到的可选包（best-effort，失败不阻塞训练镜像）----
+# onnxsim: tools/export_onnx_building.py 用 try/except 包着，可选
+RUN python -m pip install --no-cache-dir onnxsim==0.4.36 \
+        || echo "[warn] onnxsim 装失败，export_onnx 会跳过 simplify 步骤"
 
 # ---- 业务代码 ----
 WORKDIR /workspace/mmseg
